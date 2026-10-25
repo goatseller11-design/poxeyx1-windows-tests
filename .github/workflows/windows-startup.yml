@@ -153,37 +153,19 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 8
     steps:
-      - name: Verify installation, launch, upgrade and uninstall without administrator membership
+      - name: Verify install, launch, upgrade and uninstall with administrator access removed
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
-          $dir=Join-Path $env:PUBLIC 'Documents\Poxey-Standard-QA'
+          $dir=Join-Path $env:LOCALAPPDATA 'Poxey-Standard-QA'
           New-Item -ItemType Directory -Path $dir -Force|Out-Null
           $url='https://poxeyx1-private-admin.6sk6r6gbpz.workers.dev/download/windows-26.2.2'
           Invoke-WebRequest $url -OutFile "$dir\PoxeySetup.exe" -TimeoutSec 90
           if((Get-FileHash "$dir\PoxeySetup.exe" -Algorithm SHA256).Hash.ToLower() -ne 'e0f26524b47b470cf8ee6575aff18b2de922d6e00a5e7f13663593822dbade92'){throw 'Unexpected installer hash'}
-          $password=ConvertTo-SecureString (([guid]::NewGuid().ToString('N'))+'aA!') -AsPlainText -Force
-          $account=New-LocalUser -Name 'poxeyqa' -Password $password -AccountNeverExpires
-          Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account
-          # A disposable account has never logged on. Create its normal Windows
-          # profile using the documented Userenv API before testing as that user.
-          Add-Type -TypeDefinition @'
-          using System.Runtime.InteropServices;
-          using System.Text;
-          public static class PoxeyQaProfile {
-            [DllImport("userenv.dll", CharSet=CharSet.Unicode)]
-            public static extern int CreateProfile(string sid, string user, StringBuilder path, uint length);
-          }
-          '@
-          $profilePath=[Text.StringBuilder]::new(1024)
-          $created=[PoxeyQaProfile]::CreateProfile($account.SID.Value,$account.Name,$profilePath,1024)
-          if($created -ne 0){throw "Disposable Windows profile creation failed: $created"}
-          & icacls $dir /grant "*$($account.SID.Value):(OI)(CI)M"|Out-Null
-          if($LASTEXITCODE -ne 0){throw 'QA directory access could not be prepared'}
           $source=@'
           param([Parameter(Mandatory=$true)][string]$Installer,[Parameter(Mandatory=$true)][string]$OutputDirectory)
           $ErrorActionPreference='Stop'
-          $result=[ordered]@{passed=$false;coverage='Disposable Windows Server 2022 standard account; not a Windows 10/11 hardware test'}
+          $result=[ordered]@{passed=$false;coverage='Windows Server 2022, existing QA profile with restricted token: Administrators denied and privileges removed; not a fresh-account or Windows 10/11 hardware test'}
           try {
             $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
             $principal=[Security.Principal.WindowsPrincipal]::new($identity)
@@ -259,21 +241,63 @@ jobs:
           $result|ConvertTo-Json -Depth 5|Set-Content -LiteralPath "$OutputDirectory\standard-user-result.json"
           $result|ConvertTo-Json -Depth 5|Write-Host
           if(!$result.passed){exit 1}
+
           '@
           Set-Content "$dir\standard-user.ps1" -Value $source
-          $credential=[PSCredential]::new("$env:COMPUTERNAME\poxeyqa",$password)
-          $p=Start-Process powershell.exe -Credential $credential -LoadUserProfile -UseNewEnvironment -ArgumentList "-NoProfile -File `"$dir\standard-user.ps1`" -Installer `"$dir\PoxeySetup.exe`" -OutputDirectory `"$dir`"" -PassThru -RedirectStandardOutput "$dir\scope-stdout.txt" -RedirectStandardError "$dir\scope-stderr.txt"
-          if(!$p.WaitForExit(240000)){throw 'Standard-user verification timed out'}
+          $runner=@'
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          public static class PoxeyRestrictedRunner {
+            [StructLayout(LayoutKind.Sequential)] struct SidAttribute { public IntPtr Sid; public uint Attributes; }
+            [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct StartupInfo {
+              public int cb; public string reserved,desktop,title; public int x,y,xSize,ySize,xChars,yChars,fill,flags;
+              public short show,reservedSize; public IntPtr reservedBytes,stdInput,stdOutput,stdError;
+            }
+            [StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr process,thread; public uint processId,threadId; }
+            [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+            [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+            [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
+            [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
+            [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
+            [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint code);
+            [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
+            [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ConvertStringSidToSid(string value,out IntPtr sid);
+            [DllImport("advapi32.dll",SetLastError=true)] static extern bool CreateRestrictedToken(IntPtr existing,uint flags,uint disabledCount,[In]SidAttribute[] disabled,uint deletedCount,IntPtr deleted,uint restrictedCount,IntPtr restricted,out IntPtr token);
+            [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessWithTokenW(IntPtr token,uint logonFlags,string application,StringBuilder command,uint flags,IntPtr environment,string directory,ref StartupInfo startup,out ProcessInfo process);
+            static void Check(bool success,string operation) { if(!success)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),operation); }
+            public static int Run(string executable,string arguments,string directory) {
+              IntPtr token=IntPtr.Zero,restricted=IntPtr.Zero,adminSid=IntPtr.Zero; ProcessInfo process=new ProcessInfo();
+              try {
+                Check(OpenProcessToken(GetCurrentProcess(),0xF01FF,out token),"Open own QA token");
+                Check(ConvertStringSidToSid("S-1-5-32-544",out adminSid),"Resolve Administrators SID");
+                // Deny the Administrators group and remove all removable privileges.
+                // No account, UAC, Defender, SmartScreen or security-policy settings change.
+                Check(CreateRestrictedToken(token,1,1,new[]{new SidAttribute{Sid=adminSid}},0,IntPtr.Zero,0,IntPtr.Zero,out restricted),"Create standard-privilege QA token");
+                StartupInfo startup=new StartupInfo();startup.cb=Marshal.SizeOf(typeof(StartupInfo));startup.desktop="winsta0\\default";
+                Check(CreateProcessWithTokenW(restricted,0,executable,new StringBuilder("\""+executable+"\" "+arguments),0x08000000,IntPtr.Zero,directory,ref startup,out process),"Start standard-privilege QA process");
+                if(WaitForSingleObject(process.process,240000)!=0) { TerminateProcess(process.process,1460);throw new TimeoutException("Standard-privilege test timed out"); }
+                uint exit;Check(GetExitCodeProcess(process.process,out exit),"Read QA exit code");return unchecked((int)exit);
+              } finally {
+                if(process.thread!=IntPtr.Zero)CloseHandle(process.thread);if(process.process!=IntPtr.Zero)CloseHandle(process.process);
+                if(restricted!=IntPtr.Zero)CloseHandle(restricted);if(token!=IntPtr.Zero)CloseHandle(token);if(adminSid!=IntPtr.Zero)LocalFree(adminSid);
+              }
+            }
+          }
+
+          '@
+          Add-Type -TypeDefinition $runner
+          $exe="$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          $arguments="-NoProfile -File `"$dir\standard-user.ps1`" -Installer `"$dir\PoxeySetup.exe`" -OutputDirectory `"$dir`""
+          $code=[PoxeyRestrictedRunner]::Run($exe,$arguments,$dir)
           Get-Content "$dir\standard-user-result.json" -ErrorAction SilentlyContinue|Write-Host
-          Get-Content "$dir\scope-stderr.txt" -ErrorAction SilentlyContinue|Write-Host
-          if($p.ExitCode -ne 0){throw "Standard-user verification failed: $($p.ExitCode)"}
-      - name: Retain standard-user results
+          if($code -ne 0){throw "Standard-privilege verification failed: $code"}
+      - name: Retain standard-privilege results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: poxey-standard-user-${{ github.run_number }}
           path: |
-            C:/Users/Public/Documents/Poxey-Standard-QA/*.json
-            C:/Users/Public/Documents/Poxey-Standard-QA/scope-*.txt
+            C:/Users/runneradmin/AppData/Local/Poxey-Standard-QA/*.json
           retention-days: 7
           if-no-files-found: warn
