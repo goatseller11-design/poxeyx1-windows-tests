@@ -10,7 +10,13 @@ concurrency:
   cancel-in-progress: false
 jobs:
   startup:
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      POXEY_TEST_RUNNER: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - name: Download checksum-verified beta
@@ -28,7 +34,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $evidence="$env:RUNNER_TEMP\poxey-evidence"
-          $report=[ordered]@{testedAt=[DateTime]::UtcNow.ToString('o');os=[Environment]::OSVersion.VersionString;platformCoverage='Windows Server 2022 runner; Windows 10/11 desktop testing remains separate';passed=$false}
+          $report=[ordered]@{testedAt=[DateTime]::UtcNow.ToString('o');os=[Environment]::OSVersion.VersionString;platformCoverage=$env:POXEY_TEST_RUNNER;osArchitecture=[Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString();browserBinaryArchitecture='x64';passed=$false}
           $started=Get-Date
           $app=$null
           try {
@@ -139,7 +145,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: poxey-windows-startup-${{ github.run_number }}
+          name: poxey-windows-startup-${{ matrix.os }}-${{ github.run_number }}
           path: ${{ runner.temp }}/poxey-evidence/
           retention-days: 7
           if-no-files-found: warn
@@ -159,6 +165,19 @@ jobs:
           $password=ConvertTo-SecureString (([guid]::NewGuid().ToString('N'))+'aA!') -AsPlainText -Force
           $account=New-LocalUser -Name 'poxeyqa' -Password $password -AccountNeverExpires
           Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account
+          # A disposable account has never logged on. Create its normal Windows
+          # profile using the documented Userenv API before testing as that user.
+          Add-Type -TypeDefinition @'
+          using System.Runtime.InteropServices;
+          using System.Text;
+          public static class PoxeyQaProfile {
+            [DllImport("userenv.dll", CharSet=CharSet.Unicode)]
+            public static extern int CreateProfile(string sid, string user, StringBuilder path, uint length);
+          }
+          '@
+          $profilePath=[Text.StringBuilder]::new(1024)
+          $created=[PoxeyQaProfile]::CreateProfile($account.SID.Value,$account.Name,$profilePath,1024)
+          if($created -ne 0){throw "Disposable Windows profile creation failed: $created"}
           & icacls $dir /grant "*$($account.SID.Value):(OI)(CI)M"|Out-Null
           if($LASTEXITCODE -ne 0){throw 'QA directory access could not be prepared'}
           $source=@'
@@ -243,7 +262,7 @@ jobs:
           '@
           Set-Content "$dir\standard-user.ps1" -Value $source
           $credential=[PSCredential]::new("$env:COMPUTERNAME\poxeyqa",$password)
-          $p=Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList "-NoProfile -File `"$dir\standard-user.ps1`" -Installer `"$dir\PoxeySetup.exe`" -OutputDirectory `"$dir`"" -PassThru -RedirectStandardOutput "$dir\scope-stdout.txt" -RedirectStandardError "$dir\scope-stderr.txt"
+          $p=Start-Process powershell.exe -Credential $credential -LoadUserProfile -UseNewEnvironment -ArgumentList "-NoProfile -File `"$dir\standard-user.ps1`" -Installer `"$dir\PoxeySetup.exe`" -OutputDirectory `"$dir`"" -PassThru -RedirectStandardOutput "$dir\scope-stdout.txt" -RedirectStandardError "$dir\scope-stderr.txt"
           if(!$p.WaitForExit(240000)){throw 'Standard-user verification timed out'}
           Get-Content "$dir\standard-user-result.json" -ErrorAction SilentlyContinue|Write-Host
           Get-Content "$dir\scope-stderr.txt" -ErrorAction SilentlyContinue|Write-Host
