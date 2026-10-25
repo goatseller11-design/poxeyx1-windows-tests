@@ -36,7 +36,7 @@ jobs:
             $env:POXEY_TEST_PROFILE="$env:RUNNER_TEMP\poxey-empty-qa-profile"
             $env:POXEY_ARCADE_EVIDENCE_DIR=$evidence
             Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
-            $installer=Start-Process "$env:RUNNER_TEMP\PoxeySetup.exe" -PassThru
+            $installer=Start-Process "$env:RUNNER_TEMP\PoxeySetup.exe" -ArgumentList '/S','--force-run' -PassThru
             if(!$installer.WaitForExit(90000)){throw 'Installer timed out'}
             $report.installerExitCode=$installer.ExitCode
             if($installer.ExitCode -ne 0){throw "Installer failed: $($installer.ExitCode)"}
@@ -49,8 +49,9 @@ jobs:
               if($automatic){break}
               Start-Sleep -Seconds 1
             }
-            if(!$automatic){throw 'The normal one-click installer did not automatically open a visible browser window'}
+            if(!$automatic){throw 'The installer launch-after-finish path did not open a visible browser window'}
             $report.launchAfterInstall=$true
+            $report.installerUIAutomation='Silent install plus the maintained --force-run launch path; the informational beta notice is skipped for automation'
             if(!$automatic.CloseMainWindow() -or !$automatic.WaitForExit(15000)){throw 'The automatically launched browser did not quit normally'}
             $report.installedFolderLeaf=Split-Path $folder -Leaf
             $report.exeVersion=(Get-Item "$folder\PoxeyX1.exe").VersionInfo.FileVersion
