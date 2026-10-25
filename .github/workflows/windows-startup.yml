@@ -18,10 +18,10 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\poxey-evidence" -Force | Out-Null
-          $url='https://poxeyx1-website-review.pages.dev/downloads/PoxeyX1-26.2.1-beta.1-Windows-x64-UserSetup.exe'
+          $url='https://poxeyx1-private-admin.6sk6r6gbpz.workers.dev/download/windows-26.2.2'
           Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\PoxeySetup.exe" -TimeoutSec 90
           $hash=(Get-FileHash "$env:RUNNER_TEMP\PoxeySetup.exe" -Algorithm SHA256).Hash.ToLower()
-          if($hash -ne 'c1aa65678c3c2f6767d4cdf8c852229a467f4263dbaa66a4bb113dc635e82079'){throw 'Unexpected installer hash'}
+          if($hash -ne 'e0f26524b47b470cf8ee6575aff18b2de922d6e00a5e7f13663593822dbade92'){throw 'Unexpected installer hash'}
           Write-Host 'Installer integrity passed. No provider credentials or security-policy changes.'
       - name: Install and verify the real Windows renderer
         shell: pwsh
@@ -57,7 +57,7 @@ jobs:
               Start-Sleep -Seconds 1
               $app.Refresh()
               if($app.HasExited){$report.appExitCode=$app.ExitCode;throw "Browser exited during startup: $($app.ExitCode)"}
-              try {$target=Invoke-RestMethod 'http://127.0.0.1:9223/json/list' -TimeoutSec 1|Where-Object {$_.type -eq 'page' -and $_.url -match '^file:.*[/\\]index\.html'}|Select-Object -First 1}catch{}
+              try {foreach($candidate in (Invoke-RestMethod 'http://127.0.0.1:9223/json/list' -TimeoutSec 1)){if($candidate.type -eq 'page' -and $candidate.url -match '^file:.*[/\\]index\.html'){$target=$candidate;break}}}catch{}
               if($target){break}
             }
             if(!$target){throw 'No actual browser shell renderer appeared within 30 seconds'}
@@ -91,7 +91,7 @@ jobs:
           }catch{$report.failure=$_.Exception.Message;Write-Host "Startup verification failed: $($report.failure)"}
           finally {
             if($app -and !$app.HasExited){Stop-Process -Id $app.Id -ErrorAction SilentlyContinue}
-            $events=Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=$started} -ErrorAction SilentlyContinue|Where-Object {$_.ProviderName -in @('Application Error','Windows Error Reporting','SideBySide') -and $_.Message -match 'PoxeyX1\.exe'}|Select-Object -First 5
+            $events=Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=$started} -ErrorAction SilentlyContinue|Where-Object {$_.ProviderName -in @('Application Error','Windows Error Reporting','SideBySide') -and $_.Message -match '(PoxeyX1|PoxeySetup)\.exe'}|Select-Object -First 5
             $events|ForEach-Object {$_.Message}|Set-Content "$evidence\application-events.txt"
             foreach($log in Get-ChildItem $evidence -File|Where-Object {$_.Extension -in @('.txt','.log','.jsonl')}) {
               $text=[IO.File]::ReadAllText($log.FullName)
