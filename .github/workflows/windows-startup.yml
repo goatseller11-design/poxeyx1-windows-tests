@@ -144,7 +144,6 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
   standard_user:
-    needs: startup
     runs-on: windows-2022
     timeout-minutes: 8
     steps:
@@ -171,20 +170,23 @@ jobs:
             $principal=[Security.Principal.WindowsPrincipal]::new($identity)
             $result.isAdministrator=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
             if($result.isAdministrator){throw 'The test must actually run without administrator membership'}
-            $env:USERPROFILE=[Environment]::GetFolderPath('UserProfile')
-            $env:LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData')
-            $env:APPDATA=[Environment]::GetFolderPath('ApplicationData')
-            if(!$env:USERPROFILE -or !$env:LOCALAPPDATA.StartsWith($env:USERPROFILE,[StringComparison]::OrdinalIgnoreCase)){throw 'Own local profile unavailable'}
+            $result.stage='initializing-disposable-user-profile'
+            $env:USERPROFILE=[Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile,[Environment+SpecialFolderOption]::Create)
+            $env:LOCALAPPDATA=[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData,[Environment+SpecialFolderOption]::Create)
+            $env:APPDATA=[Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData,[Environment+SpecialFolderOption]::Create)
+            if(!$env:USERPROFILE -or !$env:LOCALAPPDATA -or !$env:APPDATA -or !$env:LOCALAPPDATA.StartsWith($env:USERPROFILE,[StringComparison]::OrdinalIgnoreCase)){throw 'Own local profile unavailable'}
             function Run-Installer {
               $p=Start-Process -FilePath $Installer -ArgumentList '/S' -PassThru
               if(!$p.WaitForExit(90000)){throw 'Standard-user installer timed out'}
               if($p.ExitCode -ne 0){throw "Standard-user installer exit $($p.ExitCode)"}
             }
+            $result.stage='first-install'
             Run-Installer
             $folder=Join-Path $env:LOCALAPPDATA 'Programs\PoxeyX1 Consumer Beta'
             $exe=Join-Path $folder 'PoxeyX1.exe'
             if(!(Test-Path -LiteralPath $exe)){throw 'The standard-user installation was not created in its own profile'}
             $result.perUserInstall=$true
+            $result.stage='current-user-registration'
             $registration=@(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'|Where-Object {$_.DisplayName -like '*PoxeyX1*' -and $_.DisplayVersion -like '26.2.2*'})
             if($registration.Count -ne 1 -or $registration[0].InstallLocation.TrimEnd('\') -ne $folder){throw 'Incorrect current-user uninstall registration'}
             $result.currentUserRegistration=$true
@@ -195,6 +197,7 @@ jobs:
             $env:POXEY_DIAGNOSTIC='1'
             $env:POXEY_TEST_PROFILE=Join-Path $env:LOCALAPPDATA 'PoxeyX1-Scope-QA'
             Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+            $result.stage='browser-launch'
             $app=Start-Process $exe -ArgumentList '--remote-debugging-port=9224','--remote-debugging-address=127.0.0.1' -PassThru -RedirectStandardError "$OutputDirectory\standard-stderr.txt" -RedirectStandardOutput "$OutputDirectory\standard-stdout.txt"
             try {
               $renderer=$null
@@ -209,6 +212,7 @@ jobs:
               $result.standardUserRenderer=$true
             }finally{if(!$app.HasExited){Stop-Process -Id $app.Id -ErrorAction SilentlyContinue}}
             Start-Sleep -Seconds 2
+            $result.stage='same-version-upgrade'
             Run-Installer
             if(!(Test-Path -LiteralPath $marker) -or !(Test-Path -LiteralPath $exe)){throw 'Upgrade lost QA profile or executable'}
             $result.upgradePreservedProfile=$true
@@ -220,6 +224,7 @@ jobs:
             $valid=@($links|Where-Object {$shell.CreateShortcut($_.FullName).TargetPath -eq $exe})
             if(!$valid.Count){throw 'Shortcut target does not match installed executable'}
             $result.shortcutTargetsCorrect=$true
+            $result.stage='uninstall'
             $uninstaller=Get-ChildItem $folder -Filter '*Uninstall*.exe'|Select-Object -First 1
             if(!$uninstaller){throw 'Uninstaller missing'}
             $p=Start-Process $uninstaller.FullName -ArgumentList '/S' -PassThru
@@ -231,11 +236,10 @@ jobs:
             $result.standardUserUninstall=$true
             $result.uninstallPreservedProfile=$true
             $result.passed=$true
-          }catch{$result.failure=$_.Exception.Message}
+          }catch{$result.failure=$_.Exception.Message;$result.failureLine=$_.InvocationInfo.ScriptLineNumber;$result.failureLocation=$_.InvocationInfo.PositionMessage}
           $result|ConvertTo-Json -Depth 5|Set-Content -LiteralPath "$OutputDirectory\standard-user-result.json"
           $result|ConvertTo-Json -Depth 5|Write-Host
           if(!$result.passed){exit 1}
-
           '@
           Set-Content "$dir\standard-user.ps1" -Value $source
           $credential=[PSCredential]::new("$env:COMPUTERNAME\poxeyqa",$password)
