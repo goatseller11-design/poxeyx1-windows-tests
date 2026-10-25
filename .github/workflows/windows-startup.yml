@@ -32,13 +32,26 @@ jobs:
           $started=Get-Date
           $app=$null
           try {
-            $installer=Start-Process "$env:RUNNER_TEMP\PoxeySetup.exe" -ArgumentList '/S' -PassThru
+            $env:POXEY_DIAGNOSTIC='1'
+            $env:POXEY_TEST_PROFILE="$env:RUNNER_TEMP\poxey-empty-qa-profile"
+            $env:POXEY_ARCADE_EVIDENCE_DIR=$evidence
+            Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+            $installer=Start-Process "$env:RUNNER_TEMP\PoxeySetup.exe" -PassThru
             if(!$installer.WaitForExit(90000)){throw 'Installer timed out'}
             $report.installerExitCode=$installer.ExitCode
             if($installer.ExitCode -ne 0){throw "Installer failed: $($installer.ExitCode)"}
             $folders=@("$env:LOCALAPPDATA\Programs\poxeyx1-consumer-beta","$env:LOCALAPPDATA\Programs\PoxeyX1 Consumer Beta")
             $folder=$folders|Where-Object {Test-Path -LiteralPath "$_\PoxeyX1.exe"}|Select-Object -First 1
             if(!$folder){throw 'No per-user installed executable'}
+            $automatic=$null
+            for($launch=0;$launch -lt 20;$launch++) {
+              $automatic=Get-Process -Name PoxeyX1 -ErrorAction SilentlyContinue|Where-Object {$_.Path -eq "$folder\PoxeyX1.exe" -and $_.MainWindowHandle -ne 0}|Select-Object -First 1
+              if($automatic){break}
+              Start-Sleep -Seconds 1
+            }
+            if(!$automatic){throw 'The normal one-click installer did not automatically open a visible browser window'}
+            $report.launchAfterInstall=$true
+            if(!$automatic.CloseMainWindow() -or !$automatic.WaitForExit(15000)){throw 'The automatically launched browser did not quit normally'}
             $report.installedFolderLeaf=Split-Path $folder -Leaf
             $report.exeVersion=(Get-Item "$folder\PoxeyX1.exe").VersionInfo.FileVersion
             $report.exeSignature=[string](Get-AuthenticodeSignature "$folder\PoxeyX1.exe").Status
@@ -146,7 +159,7 @@ jobs:
           $password=ConvertTo-SecureString (([guid]::NewGuid().ToString('N'))+'aA!') -AsPlainText -Force
           $account=New-LocalUser -Name 'poxeyqa' -Password $password -AccountNeverExpires
           Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account
-          & icacls $dir /grant "$($account.SID.Value):(OI)(CI)M"|Out-Null
+          & icacls $dir /grant "*$($account.SID.Value):(OI)(CI)M"|Out-Null
           if($LASTEXITCODE -ne 0){throw 'QA directory access could not be prepared'}
           $source=@'
           param([Parameter(Mandatory=$true)][string]$Installer,[Parameter(Mandatory=$true)][string]$OutputDirectory)
