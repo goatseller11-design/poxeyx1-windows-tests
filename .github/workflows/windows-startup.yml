@@ -129,3 +129,114 @@ jobs:
           path: ${{ runner.temp }}/poxey-evidence/
           retention-days: 7
           if-no-files-found: warn
+  standard_user:
+    needs: startup
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - name: Verify installation, launch, upgrade and uninstall without administrator membership
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $dir=Join-Path $env:PUBLIC 'Documents\Poxey-Standard-QA'
+          New-Item -ItemType Directory -Path $dir -Force|Out-Null
+          $url='https://poxeyx1-private-admin.6sk6r6gbpz.workers.dev/download/windows-26.2.2'
+          Invoke-WebRequest $url -OutFile "$dir\PoxeySetup.exe" -TimeoutSec 90
+          if((Get-FileHash "$dir\PoxeySetup.exe" -Algorithm SHA256).Hash.ToLower() -ne 'e0f26524b47b470cf8ee6575aff18b2de922d6e00a5e7f13663593822dbade92'){throw 'Unexpected installer hash'}
+          $password=ConvertTo-SecureString (([guid]::NewGuid().ToString('N'))+'aA!') -AsPlainText -Force
+          $account=New-LocalUser -Name 'poxeyqa' -Password $password -AccountNeverExpires
+          Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account
+          & icacls $dir /grant "$($account.SID.Value):(OI)(CI)M"|Out-Null
+          if($LASTEXITCODE -ne 0){throw 'QA directory access could not be prepared'}
+          $source=@'
+          param([Parameter(Mandatory=$true)][string]$Installer,[Parameter(Mandatory=$true)][string]$OutputDirectory)
+          $ErrorActionPreference='Stop'
+          $result=[ordered]@{passed=$false;coverage='Disposable Windows Server 2022 standard account; not a Windows 10/11 hardware test'}
+          try {
+            $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal=[Security.Principal.WindowsPrincipal]::new($identity)
+            $result.isAdministrator=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if($result.isAdministrator){throw 'The test must actually run without administrator membership'}
+            $env:USERPROFILE=[Environment]::GetFolderPath('UserProfile')
+            $env:LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData')
+            $env:APPDATA=[Environment]::GetFolderPath('ApplicationData')
+            if(!$env:USERPROFILE -or !$env:LOCALAPPDATA.StartsWith($env:USERPROFILE,[StringComparison]::OrdinalIgnoreCase)){throw 'Own local profile unavailable'}
+            function Run-Installer {
+              $p=Start-Process -FilePath $Installer -ArgumentList '/S' -PassThru
+              if(!$p.WaitForExit(90000)){throw 'Standard-user installer timed out'}
+              if($p.ExitCode -ne 0){throw "Standard-user installer exit $($p.ExitCode)"}
+            }
+            Run-Installer
+            $folder=Join-Path $env:LOCALAPPDATA 'Programs\PoxeyX1 Consumer Beta'
+            $exe=Join-Path $folder 'PoxeyX1.exe'
+            if(!(Test-Path -LiteralPath $exe)){throw 'The standard-user installation was not created in its own profile'}
+            $result.perUserInstall=$true
+            $registration=@(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'|Where-Object {$_.DisplayName -like '*PoxeyX1*' -and $_.DisplayVersion -like '26.2.2*'})
+            if($registration.Count -ne 1 -or $registration[0].InstallLocation.TrimEnd('\') -ne $folder){throw 'Incorrect current-user uninstall registration'}
+            $result.currentUserRegistration=$true
+            $profile=Join-Path $env:APPDATA 'PoxeyX1-Consumer-Beta'
+            New-Item -ItemType Directory $profile -Force|Out-Null
+            $marker=Join-Path $profile 'qa-preserve.txt'
+            Set-Content -LiteralPath $marker -Value 'Owned temporary QA data; preserve during upgrade and uninstall.'
+            $env:POXEY_DIAGNOSTIC='1'
+            $env:POXEY_TEST_PROFILE=Join-Path $env:LOCALAPPDATA 'PoxeyX1-Scope-QA'
+            Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+            $app=Start-Process $exe -ArgumentList '--remote-debugging-port=9224','--remote-debugging-address=127.0.0.1' -PassThru -RedirectStandardError "$OutputDirectory\standard-stderr.txt" -RedirectStandardOutput "$OutputDirectory\standard-stdout.txt"
+            try {
+              $renderer=$null
+              for($i=0;$i -lt 25;$i++) {
+                Start-Sleep -Seconds 1
+                $app.Refresh()
+                if($app.HasExited){throw "Standard-user browser exited: $($app.ExitCode)"}
+                try {foreach($target in (Invoke-RestMethod 'http://127.0.0.1:9224/json/list' -TimeoutSec 1)){if($target.type -eq 'page' -and $target.url -match '^file:.*[/\\]index\.html'){$renderer=$target;break}}}catch{}
+                if($renderer){break}
+              }
+              if(!$renderer){throw 'The standard-user browser did not create its shell renderer'}
+              $result.standardUserRenderer=$true
+            }finally{if(!$app.HasExited){Stop-Process -Id $app.Id -ErrorAction SilentlyContinue}}
+            Start-Sleep -Seconds 2
+            Run-Installer
+            if(!(Test-Path -LiteralPath $marker) -or !(Test-Path -LiteralPath $exe)){throw 'Upgrade lost QA profile or executable'}
+            $result.upgradePreservedProfile=$true
+            $desktop=[Environment]::GetFolderPath('Desktop')
+            $startMenu=Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+            $links=@(Get-ChildItem $desktop,$startMenu -Filter '*PoxeyX1*.lnk' -Recurse -ErrorAction SilentlyContinue)
+            if(!$links.Count){throw 'No Start menu or Desktop shortcut'}
+            $shell=New-Object -ComObject WScript.Shell
+            $valid=@($links|Where-Object {$shell.CreateShortcut($_.FullName).TargetPath -eq $exe})
+            if(!$valid.Count){throw 'Shortcut target does not match installed executable'}
+            $result.shortcutTargetsCorrect=$true
+            $uninstaller=Get-ChildItem $folder -Filter '*Uninstall*.exe'|Select-Object -First 1
+            if(!$uninstaller){throw 'Uninstaller missing'}
+            $p=Start-Process $uninstaller.FullName -ArgumentList '/S' -PassThru
+            if(!$p.WaitForExit(60000)){throw 'Standard-user uninstall timed out'}
+            if($p.ExitCode -ne 0){throw "Uninstaller exit $($p.ExitCode)"}
+            for($i=0;$i -lt 25 -and (Test-Path -LiteralPath $exe);$i++){Start-Sleep -Seconds 1}
+            if(Test-Path -LiteralPath $exe){throw 'Uninstall left installed executable behind'}
+            if(!(Test-Path -LiteralPath $marker)){throw 'Uninstall deleted the QA profile'}
+            $result.standardUserUninstall=$true
+            $result.uninstallPreservedProfile=$true
+            $result.passed=$true
+          }catch{$result.failure=$_.Exception.Message}
+          $result|ConvertTo-Json -Depth 5|Set-Content -LiteralPath "$OutputDirectory\standard-user-result.json"
+          $result|ConvertTo-Json -Depth 5|Write-Host
+          if(!$result.passed){exit 1}
+
+          '@
+          Set-Content "$dir\standard-user.ps1" -Value $source
+          $credential=[PSCredential]::new("$env:COMPUTERNAME\poxeyqa",$password)
+          $p=Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList "-NoProfile -File `"$dir\standard-user.ps1`" -Installer `"$dir\PoxeySetup.exe`" -OutputDirectory `"$dir`"" -PassThru -RedirectStandardOutput "$dir\scope-stdout.txt" -RedirectStandardError "$dir\scope-stderr.txt"
+          if(!$p.WaitForExit(240000)){throw 'Standard-user verification timed out'}
+          Get-Content "$dir\standard-user-result.json" -ErrorAction SilentlyContinue|Write-Host
+          Get-Content "$dir\scope-stderr.txt" -ErrorAction SilentlyContinue|Write-Host
+          if($p.ExitCode -ne 0){throw "Standard-user verification failed: $($p.ExitCode)"}
+      - name: Retain standard-user results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poxey-standard-user-${{ github.run_number }}
+          path: |
+            C:/Users/Public/Documents/Poxey-Standard-QA/*.json
+            C:/Users/Public/Documents/Poxey-Standard-QA/scope-*.txt
+          retention-days: 7
+          if-no-files-found: warn
