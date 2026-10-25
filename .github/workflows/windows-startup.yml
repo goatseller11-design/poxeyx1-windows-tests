@@ -65,10 +65,10 @@ jobs:
             $ws=[Net.WebSockets.ClientWebSocket]::new()
             $timeout=[Threading.CancellationTokenSource]::new(15000)
             try {
-              $ws.ConnectAsync([uri]$target.webSocketDebuggerUrl,$timeout.Token).GetAwaiter().GetResult()
+              $ws.ConnectAsync([uri]$target.webSocketDebuggerUrl,$timeout.Token).GetAwaiter().GetResult()|Out-Null
               function Send-CDP($id,$method,$parameters) {
                 $bytes=[Text.Encoding]::UTF8.GetBytes((@{id=$id;method=$method;params=$parameters}|ConvertTo-Json -Depth 10 -Compress))
-                $ws.SendAsync([ArraySegment[byte]]::new($bytes),[Net.WebSockets.WebSocketMessageType]::Text,$true,$timeout.Token).GetAwaiter().GetResult()
+                $ws.SendAsync([ArraySegment[byte]]::new($bytes),[Net.WebSockets.WebSocketMessageType]::Text,$true,$timeout.Token).GetAwaiter().GetResult()|Out-Null
                 do {
                   $stream=[IO.MemoryStream]::new()
                   do {$buffer=[byte[]]::new(65536);$part=$ws.ReceiveAsync([ArraySegment[byte]]::new($buffer),$timeout.Token).GetAwaiter().GetResult();$stream.Write($buffer,0,$part.Count);if($stream.Length -gt 15000000){throw 'Oversized diagnostic response'}}while(!$part.EndOfMessage)
@@ -79,11 +79,29 @@ jobs:
                 return $message.result
               }
               Start-Sleep -Seconds 3
-              $state=Send-CDP 1 'Runtime.evaluate' @{expression='JSON.stringify({title:document.title,readyState:document.readyState,textLength:document.body?.innerText?.length||0,buttonCount:document.querySelectorAll("button").length})';returnByValue=$true}
+              $state=Send-CDP 1 'Runtime.evaluate' @{expression='JSON.stringify({title:document.title,readyState:document.readyState,textLength:document.body?.innerText?.length||0,buttonCount:document.querySelectorAll("button").length,bodyDisplay:getComputedStyle(document.body).display,bodyVisibility:getComputedStyle(document.body).visibility,bodyClass:document.body.className,bodyRect:{width:document.body.getBoundingClientRect().width,height:document.body.getBoundingClientRect().height},textContentLength:document.body?.textContent?.length||0})';returnByValue=$true}
               $report.rendererState=$state.result.value|ConvertFrom-Json
-              if($report.rendererState.readyState -ne 'complete' -or $report.rendererState.textLength -lt 80 -or $report.rendererState.buttonCount -lt 1){throw 'Renderer exists but browser interface did not render'}
               $shot=Send-CDP 2 'Page.captureScreenshot' @{format='png'}
+              [IO.File]::WriteAllBytes("$evidence\windows-onboarding.png",[Convert]::FromBase64String($shot.data))
+              $setup=Send-CDP 3 'Runtime.evaluate' @{expression='JSON.stringify({present:!!document.getElementById("installed-setup"),ready:document.getElementById("installed-setup")?.contentDocument?.readyState,heading:document.getElementById("installed-setup")?.contentDocument?.getElementById("heading")?.textContent})';returnByValue=$true}
+              $report.onboardingInitial=$setup.result.value|ConvertFrom-Json
+              if($report.onboardingInitial.present) {
+                if($report.onboardingInitial.ready -ne 'complete' -or !$report.onboardingInitial.heading){throw 'First-run onboarding did not render'}
+                $report.onboardingSteps=@()
+                for($step=0;$step -lt 10;$step++) {
+                  $progress=Send-CDP (10+$step) 'Runtime.evaluate' @{expression='(()=>{const d=document.getElementById("installed-setup")?.contentDocument;const n=d?.getElementById("next");const result={progress:d?.getElementById("progressText")?.textContent,heading:d?.getElementById("heading")?.textContent,clicked:!!n&&!n.disabled};if(result.clicked)n.click();return JSON.stringify(result)})()';returnByValue=$true}
+                  $stepResult=$progress.result.value|ConvertFrom-Json
+                  $report.onboardingSteps+=,$stepResult
+                  if(!$stepResult.clicked -or !$stepResult.heading){throw "Onboarding step $step could not advance"}
+                  Start-Sleep -Milliseconds 150
+                }
+                Start-Sleep -Seconds 3
+              }
+              $state=Send-CDP 30 'Runtime.evaluate' @{expression='JSON.stringify({title:document.title,readyState:document.readyState,textLength:document.body?.innerText?.length||0,buttonCount:document.querySelectorAll("button").length,onboardingRemaining:!!document.getElementById("installed-setup"),onboardingSaved:localStorage.getItem("poxey-v2:onboarded")||localStorage.getItem("poxey:onboarded")})';returnByValue=$true}
+              $report.rendererState=$state.result.value|ConvertFrom-Json
+              $shot=Send-CDP 31 'Page.captureScreenshot' @{format='png'}
               [IO.File]::WriteAllBytes("$evidence\windows-browser.png",[Convert]::FromBase64String($shot.data))
+              if($report.rendererState.readyState -ne 'complete' -or $report.rendererState.textLength -lt 80 -or $report.rendererState.buttonCount -lt 1 -or $report.rendererState.onboardingRemaining){throw 'Browser interface did not render after onboarding'}
               $report.windowHandle=[string]$app.MainWindowHandle
               $report.workingSetMiB=[math]::Round($app.WorkingSet64/1MB,1)
               $report.passed=$true
