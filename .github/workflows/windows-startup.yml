@@ -1,0 +1,113 @@
+name: Windows beta startup verification
+on:
+  push:
+    paths: ['.github/workflows/windows-startup.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-startup
+  cancel-in-progress: false
+jobs:
+  startup:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Download checksum-verified beta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\poxey-evidence" -Force | Out-Null
+          $url='https://poxeyx1-website-review.pages.dev/downloads/PoxeyX1-26.2.1-beta.1-Windows-x64-UserSetup.exe'
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\PoxeySetup.exe" -TimeoutSec 90
+          $hash=(Get-FileHash "$env:RUNNER_TEMP\PoxeySetup.exe" -Algorithm SHA256).Hash.ToLower()
+          if($hash -ne 'c1aa65678c3c2f6767d4cdf8c852229a467f4263dbaa66a4bb113dc635e82079'){throw 'Unexpected installer hash'}
+          Write-Host 'Installer integrity passed. No provider credentials or security-policy changes.'
+      - name: Install and verify the real Windows renderer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $evidence="$env:RUNNER_TEMP\poxey-evidence"
+          $report=[ordered]@{testedAt=[DateTime]::UtcNow.ToString('o');os=[Environment]::OSVersion.VersionString;platformCoverage='Windows Server 2022 runner; Windows 10/11 desktop testing remains separate';passed=$false}
+          $started=Get-Date
+          $app=$null
+          try {
+            $installer=Start-Process "$env:RUNNER_TEMP\PoxeySetup.exe" -ArgumentList '/S' -PassThru
+            if(!$installer.WaitForExit(90000)){throw 'Installer timed out'}
+            $report.installerExitCode=$installer.ExitCode
+            if($installer.ExitCode -ne 0){throw "Installer failed: $($installer.ExitCode)"}
+            $folders=@("$env:LOCALAPPDATA\Programs\poxeyx1-consumer-beta","$env:LOCALAPPDATA\Programs\PoxeyX1 Consumer Beta")
+            $folder=$folders|Where-Object {Test-Path -LiteralPath "$_\PoxeyX1.exe"}|Select-Object -First 1
+            if(!$folder){throw 'No per-user installed executable'}
+            $report.installedFolderLeaf=Split-Path $folder -Leaf
+            $report.exeVersion=(Get-Item "$folder\PoxeyX1.exe").VersionInfo.FileVersion
+            $report.exeSignature=[string](Get-AuthenticodeSignature "$folder\PoxeyX1.exe").Status
+            $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal=[Security.Principal.WindowsPrincipal]::new($identity)
+            $report.runnerIsAdministrator=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            $report.standardUserInstallVerified=$false
+            $env:POXEY_DIAGNOSTIC='1'
+            $env:POXEY_TEST_PROFILE="$env:RUNNER_TEMP\poxey-empty-qa-profile"
+            $env:POXEY_ARCADE_EVIDENCE_DIR=$evidence
+            Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+            $app=Start-Process "$folder\PoxeyX1.exe" -ArgumentList '--remote-debugging-port=9223','--remote-debugging-address=127.0.0.1','--enable-logging',"--log-file=$evidence\chromium.log" -PassThru -RedirectStandardError "$evidence\stderr.txt" -RedirectStandardOutput "$evidence\stdout.txt"
+            $report.startupPID=$app.Id
+            $target=$null
+            for($i=0;$i -lt 30;$i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if($app.HasExited){$report.appExitCode=$app.ExitCode;throw "Browser exited during startup: $($app.ExitCode)"}
+              try {$target=Invoke-RestMethod 'http://127.0.0.1:9223/json/list' -TimeoutSec 1|Where-Object {$_.type -eq 'page' -and $_.url -match '^file:.*[/\\]index\.html'}|Select-Object -First 1}catch{}
+              if($target){break}
+            }
+            if(!$target){throw 'No actual browser shell renderer appeared within 30 seconds'}
+            $report.rendererStartedAfterSeconds=[math]::Round(((Get-Date)-$started).TotalSeconds,2)
+            $ws=[Net.WebSockets.ClientWebSocket]::new()
+            $timeout=[Threading.CancellationTokenSource]::new(15000)
+            try {
+              $ws.ConnectAsync([uri]$target.webSocketDebuggerUrl,$timeout.Token).GetAwaiter().GetResult()
+              function Send-CDP($id,$method,$parameters) {
+                $bytes=[Text.Encoding]::UTF8.GetBytes((@{id=$id;method=$method;params=$parameters}|ConvertTo-Json -Depth 10 -Compress))
+                $ws.SendAsync([ArraySegment[byte]]::new($bytes),[Net.WebSockets.WebSocketMessageType]::Text,$true,$timeout.Token).GetAwaiter().GetResult()
+                do {
+                  $stream=[IO.MemoryStream]::new()
+                  do {$buffer=[byte[]]::new(65536);$part=$ws.ReceiveAsync([ArraySegment[byte]]::new($buffer),$timeout.Token).GetAwaiter().GetResult();$stream.Write($buffer,0,$part.Count);if($stream.Length -gt 15000000){throw 'Oversized diagnostic response'}}while(!$part.EndOfMessage)
+                  $message=[Text.Encoding]::UTF8.GetString($stream.ToArray())|ConvertFrom-Json
+                  $stream.Dispose()
+                }while($message.id -ne $id)
+                if($message.error){throw "CDP failed: $($message.error.message)"}
+                return $message.result
+              }
+              Start-Sleep -Seconds 3
+              $state=Send-CDP 1 'Runtime.evaluate' @{expression='JSON.stringify({title:document.title,readyState:document.readyState,textLength:document.body?.innerText?.length||0,buttonCount:document.querySelectorAll("button").length})';returnByValue=$true}
+              $report.rendererState=$state.result.value|ConvertFrom-Json
+              if($report.rendererState.readyState -ne 'complete' -or $report.rendererState.textLength -lt 80 -or $report.rendererState.buttonCount -lt 1){throw 'Renderer exists but browser interface did not render'}
+              $shot=Send-CDP 2 'Page.captureScreenshot' @{format='png'}
+              [IO.File]::WriteAllBytes("$evidence\windows-browser.png",[Convert]::FromBase64String($shot.data))
+              $report.windowHandle=[string]$app.MainWindowHandle
+              $report.workingSetMiB=[math]::Round($app.WorkingSet64/1MB,1)
+              $report.passed=$true
+            }finally{$ws.Dispose();$timeout.Dispose()}
+          }catch{$report.failure=$_.Exception.Message;Write-Host "Startup verification failed: $($report.failure)"}
+          finally {
+            if($app -and !$app.HasExited){Stop-Process -Id $app.Id -ErrorAction SilentlyContinue}
+            $events=Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=$started} -ErrorAction SilentlyContinue|Where-Object {$_.ProviderName -in @('Application Error','Windows Error Reporting','SideBySide') -and $_.Message -match 'PoxeyX1\.exe'}|Select-Object -First 5
+            $events|ForEach-Object {$_.Message}|Set-Content "$evidence\application-events.txt"
+            foreach($log in Get-ChildItem $evidence -File|Where-Object {$_.Extension -in @('.txt','.log','.jsonl')}) {
+              $text=[IO.File]::ReadAllText($log.FullName)
+              $text=$text.Replace($env:USERPROFILE,'[QA_PROFILE]').Replace($env:RUNNER_TEMP,'[QA_TEMP]')
+              $text=$text -replace '(?i)(Bearer\s+)[A-Za-z0-9._-]+','$1[REDACTED]' -replace 'gsk_[A-Za-z0-9]+','[REDACTED]' -replace 'AIza[A-Za-z0-9_-]+','[REDACTED]'
+              [IO.File]::WriteAllText($log.FullName,$text.Substring(0,[math]::Min($text.Length,100000)))
+            }
+            $report|ConvertTo-Json -Depth 10|Set-Content "$evidence\result.json"
+            $report|ConvertTo-Json -Depth 10|Write-Host
+          }
+          if(!$report.passed){throw 'Windows startup acceptance failed; inspect the retained evidence'}
+      - name: Retain real Windows evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poxey-windows-startup-${{ github.run_number }}
+          path: ${{ runner.temp }}/poxey-evidence/
+          retention-days: 7
+          if-no-files-found: warn
