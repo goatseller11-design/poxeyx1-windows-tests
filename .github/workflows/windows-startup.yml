@@ -18,6 +18,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       POXEY_TEST_RUNNER: ${{ matrix.os }}
+      POXEY_QA_INVITE: ${{ secrets.POXEY_QA_INVITE }}
     timeout-minutes: 10
     steps:
       - name: Download checksum-verified beta
@@ -84,7 +85,7 @@ jobs:
             if(!$target){throw 'No actual browser shell renderer appeared within 30 seconds'}
             $report.rendererStartedAfterSeconds=[math]::Round(((Get-Date)-$started).TotalSeconds,2)
             $ws=[Net.WebSockets.ClientWebSocket]::new()
-            $timeout=[Threading.CancellationTokenSource]::new(60000)
+            $timeout=[Threading.CancellationTokenSource]::new(240000)
             try {
               $ws.ConnectAsync([uri]$target.webSocketDebuggerUrl,$timeout.Token).GetAwaiter().GetResult()|Out-Null
               function Send-CDP($id,$method,$parameters) {
@@ -137,6 +138,37 @@ jobs:
               $report.publicWebpage=$page
               $shot=Send-CDP 60 'Page.captureScreenshot' @{format='png'}
               [IO.File]::WriteAllBytes("$evidence\windows-browsing.png",[Convert]::FromBase64String($shot.data))
+              & {
+              # Invoked inside the installed browser's CDP acceptance connection. No provider keys.
+              function Eval-Host([int]$id,[string]$expression){$x=Send-CDP $id 'Runtime.evaluate' @{expression=$expression;returnByValue=$true;awaitPromise=$true};if($x.exceptionDetails){throw 'Browser acceptance JavaScript failed'};return $x.result.value}
+              function Eval-Chat([int]$id,[string]$expression){$quoted=ConvertTo-Json -InputObject $expression -Compress;return Eval-Host $id "document.getElementById('conversations-view').executeJavaScript($quoted,true)"}
+              $report.ai=[ordered]@{status='not-run';answers=@()}
+              if($env:POXEY_TEST_RUNNER -ne 'windows-11-arm' -or !$env:POXEY_QA_INVITE){$report.ai.reason='Live AI requires a single-use QA invitation in the protected repository secret; no mocked response was substituted.';return}
+              Eval-Host 100 'setPref("cloud-ai","on");setPref("awareness","auto");showAI();void 0'|Out-Null
+              $viewReady=$false
+              for($i=0;$i -lt 30;$i++){Start-Sleep -Milliseconds 300;if(Eval-Host (101+$i) '!!document.getElementById("conversations-view")'){$viewReady=$true;break}}
+              if(!$viewReady){throw 'Windows Conversations did not open its isolated guest'}
+              Start-Sleep -Seconds 2
+              $invite=ConvertTo-Json -InputObject $env:POXEY_QA_INVITE -Compress
+              $enroll=Eval-Chat 140 "(async()=>{const c=await(await fetch('/api/config')).json();if(!c.enrollmentRequired)return true;const r=await fetch('/api/beta/enroll',{method:'POST',headers:{'Content-Type':'application/json','X-Lab-CSRF':c.csrf},body:JSON.stringify({invite:$invite})});if(!r.ok)return false;location.reload();return true})()"
+              if(!$enroll){throw 'Windows QA enrollment was unavailable; no provider call made'}
+              Start-Sleep -Seconds 2
+              Eval-Chat 141 '(async()=>{const c=await(await fetch("/api/config")).json();const r=await fetch("/api/screen/setup",{method:"POST",headers:{"Content-Type":"application/json","X-Lab-CSRF":c.csrf},body:JSON.stringify({enable:true,cloudConsent:true,app:"poxey-active-tab"})});return r.ok})()'|Out-Null
+              $cases=@(@{mode='fast';q='What is this page about? Explain in two simple sentences.';expect='domain|documentation';fresh=$true},@{mode='smart';q='Explain in two sentences why water boils at a lower temperature at high altitude.';expect='pressure';fresh=$true},@{mode='auto';q='Write a friendly one-sentence thank-you note to a teacher.';expect='thank';fresh=$true},@{mode='fast';q='Research the official Cloudflare Workers AI free daily neuron limit. Explain whether it is unlimited, citing the official source.';expect='10[, ]?000';fresh=$true},@{mode='auto';q='Does that mean unlimited AI? Explain simply.';expect='no|not|limit';fresh=$false})
+              $seq=150
+              foreach($case in $cases){Start-Sleep -Seconds 6;$seq++;$question=ConvertTo-Json -InputObject $case.q -Compress;$new=if($case.fresh){"document.getElementById('new').click();"}else{''};Eval-Chat $seq "$new document.querySelector('[data-mode=$($case.mode)]').click();document.getElementById('prompt').value=$question;document.getElementById('composer').requestSubmit();void 0"|Out-Null;$at=Get-Date;$reply=$null
+               for($i=0;$i -lt 80;$i++){Start-Sleep -Milliseconds 400;$seq++;$raw=Eval-Chat $seq 'JSON.stringify(JSON.parse(localStorage.getItem("poxey-ai-lab-history-v1")||"[]")[0]?.messages.at(-1)||{})';$candidate=$raw|ConvertFrom-Json;if($candidate.role -eq 'assistant' -and $candidate.status -ne 'pending'){$reply=$candidate;break}}
+               if(!$reply){throw 'Bounded live AI timeout; no duplicate request sent'}
+               $item=[ordered]@{question=$case.q;requestedMode=$case.mode;answeredMode=$reply.aiMode;status=$reply.status;answer=$reply.content;sources=$reply.sources;screenContext=$reply.screenContext;ms=[int]((Get-Date)-$at).TotalMilliseconds}
+               $report.ai.answers+=,$item
+               if($reply.status -ne 'complete' -or $reply.content -notmatch $case.expect){throw 'A Windows live AI answer did not satisfy its factual acceptance check'}
+               if($case.q -like 'Research*' -and !(@($reply.sources|Where-Object {$_.url -like '*developers.cloudflare.com*'}).Count)){throw 'Research answer lacks the required official source'}
+              }
+              $report.ai.status='passed'
+              $shot=Send-CDP 900 'Page.captureScreenshot' @{format='png'}
+              [IO.File]::WriteAllBytes("$evidence\windows-conversations.png",[Convert]::FromBase64String($shot.data))
+              
+              }
               $report.windowHandle=[string]$app.MainWindowHandle
               $report.workingSetMiB=[math]::Round($app.WorkingSet64/1MB,1)
               $report.passed=$true
@@ -199,6 +231,10 @@ jobs:
             # Start-Process -Credential inherits the runner's environment. Use the actual
             # Windows-registered profile for this SID, never another account's home.
             if($ownProfile -and (Test-Path -LiteralPath $ownProfile)){$env:USERPROFILE=$ownProfile}else{$env:USERPROFILE=[Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile,[Environment+SpecialFolderOption]::Create)}
+            $folders=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+            $local=[Environment]::ExpandEnvironmentVariables([string]$folders.'Local AppData')
+            if(!$local -or !$local.StartsWith($env:USERPROFILE,[StringComparison]::OrdinalIgnoreCase)){throw 'Current-user Local AppData registry does not belong to its Windows profile'}
+            $env:LOCALAPPDATA=$local
             $env:LOCALAPPDATA=[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData,[Environment+SpecialFolderOption]::Create)
             $env:APPDATA=[Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData,[Environment+SpecialFolderOption]::Create)
             $result.profilePaths=@{home=$env:USERPROFILE;local=$env:LOCALAPPDATA;roaming=$env:APPDATA;identity=$identity.Name}
