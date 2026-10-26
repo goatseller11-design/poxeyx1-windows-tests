@@ -294,7 +294,7 @@ jobs:
                 // Deny the Administrators group and remove all removable privileges.
                 // No account, UAC, Defender, SmartScreen or security-policy settings change.
                 Check(CreateRestrictedToken(token,1,1,new[]{new SidAttribute{Sid=adminSid}},0,IntPtr.Zero,0,IntPtr.Zero,out restricted),"Create standard-privilege QA token");
-                StartupInfo startup=new StartupInfo();startup.cb=Marshal.SizeOf(typeof(StartupInfo));startup.desktop=null;
+                StartupInfo startup=new StartupInfo();startup.cb=Marshal.SizeOf(typeof(StartupInfo));startup.desktop="winsta0\\default";
                 Check(CreateProcessAsUserW(restricted,executable,new StringBuilder("\""+executable+"\" "+arguments),IntPtr.Zero,IntPtr.Zero,false,0x08000000,IntPtr.Zero,directory,ref startup,out process),"Start standard-privilege QA process");
                 if(WaitForSingleObject(process.process,240000)!=0) { TerminateProcess(process.process,1460);throw new TimeoutException("Standard-privilege test timed out"); }
                 uint exit;Check(GetExitCodeProcess(process.process,out exit),"Read QA exit code");return unchecked((int)exit);
