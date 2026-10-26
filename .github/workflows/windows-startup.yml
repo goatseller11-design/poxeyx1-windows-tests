@@ -253,7 +253,11 @@ jobs:
             $result.perUserInstall=$true
             Set-Stage 'current-user-registration'
             $registration=@(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'|Where-Object {$_.DisplayName -like '*PoxeyX1*' -and $_.DisplayVersion -like '26.2.2*'})
-            if($registration.Count -ne 1 -or $registration[0].InstallLocation.TrimEnd('\') -ne $folder){throw 'Incorrect current-user uninstall registration'}
+            if($registration.Count -ne 1){throw 'Incorrect number of current-user uninstall entries'}
+            # Electron Builder stores InstallLocation under Software\APP_GUID, rather
+            # than duplicating it in the Apps & Features uninstall registration.
+            $installRegistration=Get-ItemProperty ('HKCU:\Software\'+$registration[0].PSChildName)
+            if([string]::IsNullOrWhiteSpace($installRegistration.InstallLocation) -or $installRegistration.InstallLocation.TrimEnd('\') -ne $folder -or !$registration[0].UninstallString.StartsWith('"'+$folder+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Incorrect current-user install location or uninstall command'}
             $result.currentUserRegistration=$true
             $profile=Join-Path $env:APPDATA 'PoxeyX1-Consumer-Beta'
             New-Item -ItemType Directory $profile -Force|Out-Null
