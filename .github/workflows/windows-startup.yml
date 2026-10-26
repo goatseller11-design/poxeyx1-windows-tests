@@ -18,6 +18,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       POXEY_TEST_RUNNER: ${{ matrix.os }}
+      POXEY_ACTIVITY_TEST: '1'
       POXEY_QA_INVITE: ${{ secrets.POXEY_QA_INVITE }}
     timeout-minutes: 10
     steps:
@@ -26,10 +27,10 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\poxey-evidence" -Force | Out-Null
-          $url='https://poxeyx1-private-admin.6sk6r6gbpz.workers.dev/download/windows-26.2.2'
+          $url='https://poxeyx1-private-admin.6sk6r6gbpz.workers.dev/download/windows-26.2.3'
           Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\PoxeySetup.exe" -TimeoutSec 90
           $hash=(Get-FileHash "$env:RUNNER_TEMP\PoxeySetup.exe" -Algorithm SHA256).Hash.ToLower()
-          if($hash -ne 'e0f26524b47b470cf8ee6575aff18b2de922d6e00a5e7f13663593822dbade92'){throw 'Unexpected installer hash'}
+          if($hash -ne '089df35092804ebcced7a595499bbfc5671fb765081adef29a239abfa908bb4d'){throw 'Unexpected installer hash'}
           Write-Host 'Installer integrity passed. No provider credentials or security-policy changes.'
       - name: Install and verify the real Windows renderer
         shell: pwsh
@@ -138,6 +139,43 @@ jobs:
               $report.publicWebpage=$page
               $shot=Send-CDP 60 'Page.captureScreenshot' @{format='png'}
               [IO.File]::WriteAllBytes("$evidence\windows-browsing.png",[Convert]::FromBase64String($shot.data))
+              $features=Send-CDP 65 'Runtime.evaluate' @{expression='JSON.stringify((()=>{const count=tabs.length;const t=createTab();closeTab(t.id);addBookmark();setPref("windows-release-qa","saved");setTheme("light");setTheme("dark");return {tabsStable:tabs.length===count,bookmark:bookmarks.some(b=>b.url.includes("example.com")),history:history.some(b=>b.url.includes("example.com")),wallpapers:window.PoxeyWallpaperCatalogue.length,setting:getPref("windows-release-qa","")}})())';returnByValue=$true}
+              $report.browserFeatures=$features.result.value|ConvertFrom-Json
+              if(!$report.browserFeatures.tabsStable -or !$report.browserFeatures.bookmark -or !$report.browserFeatures.history -or $report.browserFeatures.wallpapers -ne 16 -or $report.browserFeatures.setting -ne 'saved'){throw 'A browser tabs/bookmark/history/wallpaper/settings check failed'}
+              $off=Send-CDP 66 'Runtime.evaluate' @{expression='(async()=>JSON.stringify(await window.electronAPI.getActivityStatus()))()';returnByValue=$true;awaitPromise=$true}
+              $off=$off.result.value|ConvertFrom-Json
+              if($off.enabled){throw 'Reporting must remain off by default in a fresh profile'}
+              Send-CDP 67 'Runtime.evaluate' @{expression='window.electronAPI.setActivityEnabled(true)';awaitPromise=$true;returnByValue=$true}|Out-Null
+              $activity=$null
+              for($i=0;$i -lt 30;$i++){Start-Sleep -Milliseconds 300;$r=Send-CDP (70+$i) 'Runtime.evaluate' @{expression='(async()=>JSON.stringify(await window.electronAPI.getActivityStatus()))()';returnByValue=$true;awaitPromise=$true};$activity=$r.result.value|ConvertFrom-Json;if($activity.lastReportedDay){break}}
+              if(!$activity.enabled -or $activity.lastReportedDay -ne [DateTime]::UtcNow.ToString('yyyy-MM-dd')){throw 'Actual Windows app did not report to the isolated analytics service'}
+              $report.testServiceActivity=$activity
+              Send-CDP 110 'Runtime.evaluate' @{expression='PoxeyArcade.open();void 0'}|Out-Null
+              $library=$null
+              for($i=0;$i -lt 30;$i++){Start-Sleep -Milliseconds 200;$r=Send-CDP (111+$i) 'Runtime.evaluate' @{expression='JSON.stringify(PoxeyArcade.snapshot())';returnByValue=$true};$library=$r.result.value|ConvertFrom-Json;if($library.count -eq 21){break}}
+              if($library.count -ne 21){throw 'Arcade did not preserve all 21 entries'}
+              $report.arcadeEntries=$library.count
+              Send-CDP 145 'Runtime.evaluate' @{expression='PoxeyArcade.launch("retro-bowl");void 0'}|Out-Null
+              Start-Sleep -Seconds 8
+              $launch=Send-CDP 146 'Runtime.evaluate' @{expression='JSON.stringify({player:!!document.getElementById("arcade-game"),state:PoxeyArcade.snapshot(),status:document.querySelector(".arcade-player-status")?.textContent})';returnByValue=$true}
+              $report.arcadeLaunch=$launch.result.value|ConvertFrom-Json
+              $report.arcadeGameplay='Launch coverage only; gameplay is not certified by a canvas or title-screen check.'
+              if(!$report.arcadeLaunch.player){throw 'Arcade did not create its isolated game guest'}
+              Send-CDP 147 'Runtime.evaluate' @{expression='window.electronAPI.arcadeFullscreen(true)';awaitPromise=$true}|Out-Null
+              Start-Sleep -Milliseconds 600
+              $full=Send-CDP 148 'Runtime.evaluate' @{expression='document.body.classList.contains("arcade-fullscreen")';returnByValue=$true}
+              if(!$full.result.value){throw 'Arcade fullscreen did not enter'}
+              $shot=Send-CDP 149 'Page.captureScreenshot' @{format='png'}
+              [IO.File]::WriteAllBytes("$evidence\windows-arcade-fullscreen.png",[Convert]::FromBase64String($shot.data))
+              Send-CDP 150 'Runtime.evaluate' @{expression='window.electronAPI.arcadeFullscreen(false)';awaitPromise=$true}|Out-Null
+              Start-Sleep -Milliseconds 600
+              $full=Send-CDP 151 'Runtime.evaluate' @{expression='document.body.classList.contains("arcade-fullscreen")';returnByValue=$true}
+              if($full.result.value){throw 'Arcade fullscreen did not exit'}
+              Send-CDP 152 'Runtime.evaluate' @{expression='PoxeyArcade.exit()';awaitPromise=$true}|Out-Null
+              $clean=Send-CDP 153 'Runtime.evaluate' @{expression='!document.getElementById("arcade-game")';returnByValue=$true}
+              if(!$clean.result.value){throw 'Arcade guest was not released'}
+              $report.arcadeFullscreenAndCleanup=$true
+              
               & {
               # Invoked inside the installed browser's CDP acceptance connection. No provider keys.
               function Eval-Host([int]$id,[string]$expression){$x=Send-CDP $id 'Runtime.evaluate' @{expression=$expression;returnByValue=$true;awaitPromise=$true};if($x.exceptionDetails){throw 'Browser acceptance JavaScript failed'};return $x.result.value}
@@ -150,8 +188,10 @@ jobs:
               if(!$viewReady){throw 'Windows Conversations did not open its isolated guest'}
               Start-Sleep -Seconds 2
               $invite=ConvertTo-Json -InputObject $env:POXEY_QA_INVITE -Compress
-              $enroll=Eval-Chat 140 "(async()=>{const c=await(await fetch('/api/config')).json();if(!c.enrollmentRequired)return true;const r=await fetch('/api/beta/enroll',{method:'POST',headers:{'Content-Type':'application/json','X-Lab-CSRF':c.csrf},body:JSON.stringify({invite:$invite})});if(!r.ok)return false;location.reload();return true})()"
+              $enroll=Eval-Chat 140 "(async()=>{const c=await(await fetch('/api/config')).json();if(!c.enrollmentRequired)return true;const r=await fetch('/api/beta/enroll',{method:'POST',headers:{'Content-Type':'application/json','X-Lab-CSRF':c.csrf},body:JSON.stringify({invite:$invite})});if(!r.ok)return false;setTimeout(()=>location.reload(),50);return true})()"
               if(!$enroll){throw 'Windows QA enrollment was unavailable; no provider call made'}
+              $credentialFile=Join-Path $env:POXEY_TEST_PROFILE 'remote-device.json'
+              if(Test-Path -LiteralPath $credentialFile){$report.ai.qaDeviceId=(Get-Content -LiteralPath $credentialFile -Raw|ConvertFrom-Json).device}
               Start-Sleep -Seconds 2
               Eval-Chat 141 '(async()=>{const c=await(await fetch("/api/config")).json();const r=await fetch("/api/screen/setup",{method:"POST",headers:{"Content-Type":"application/json","X-Lab-CSRF":c.csrf},body:JSON.stringify({enable:true,cloudConsent:true,app:"poxey-active-tab"})});return r.ok})()'|Out-Null
               $cases=@(@{mode='fast';q='What is this page about? Explain in two simple sentences.';expect='domain|documentation';fresh=$true},@{mode='smart';q='Explain in two sentences why water boils at a lower temperature at high altitude.';expect='pressure';fresh=$true},@{mode='auto';q='Write a friendly one-sentence thank-you note to a teacher.';expect='thank';fresh=$true},@{mode='fast';q='Research the official Cloudflare Workers AI free daily neuron limit. Explain whether it is unlimited, citing the official source.';expect='10[, ]?000';fresh=$true},@{mode='auto';q='Does that mean unlimited AI? Explain simply.';expect='no|not|limit';fresh=$false})
@@ -162,6 +202,9 @@ jobs:
                $item=[ordered]@{question=$case.q;requestedMode=$case.mode;answeredMode=$reply.aiMode;status=$reply.status;answer=$reply.content;sources=$reply.sources;screenContext=$reply.screenContext;ms=[int]((Get-Date)-$at).TotalMilliseconds}
                $report.ai.answers+=,$item
                if($reply.status -ne 'complete' -or $reply.content -notmatch $case.expect){throw 'A Windows live AI answer did not satisfy its factual acceptance check'}
+               if($case.mode -in @('fast','smart') -and $reply.aiMode -ne $case.mode){throw 'A manually selected AI mode changed unexpectedly'}
+               if($case.q -like 'What is this page*' -and (!$reply.screenContext -or !$reply.sources.Count -or @($reply.sources|Where-Object {$_.kind -ne 'Active page text · no web search'}).Count)){throw 'Active page question did not use only authorized active-page evidence'}
+               if(($case.q -like 'Explain in two sentences*' -or $case.q -like 'Write a friendly*') -and ($reply.screenContext -or $reply.sources.Count)){throw 'Unrelated question accessed unnecessary page or research context'}
                if($case.q -like 'Research*' -and !(@($reply.sources|Where-Object {$_.url -like '*developers.cloudflare.com*'}).Count)){throw 'Research answer lacks the required official source'}
               }
               $report.ai.status='passed'
@@ -171,6 +214,28 @@ jobs:
               }
               $report.windowHandle=[string]$app.MainWindowHandle
               $report.workingSetMiB=[math]::Round($app.WorkingSet64/1MB,1)
+              $ws.Dispose();$timeout.Dispose()
+              if(!$app.CloseMainWindow() -or !$app.WaitForExit(15000)){throw 'Windows browser did not quit cleanly after feature and AI tests'}
+              $report.normalQuitAfterTests=$true
+              $app=Start-Process "$folder\PoxeyX1.exe" -ArgumentList '--remote-debugging-port=9223','--remote-debugging-address=127.0.0.1' -PassThru
+              $target=$null
+              for($i=0;$i -lt 25;$i++){Start-Sleep -Seconds 1;try{foreach($candidate in (Invoke-RestMethod 'http://127.0.0.1:9223/json/list' -TimeoutSec 1)){if($candidate.type -eq 'page' -and $candidate.url -match '^file:.*[/\\]index\.html'){$target=$candidate;break}}}catch{};if($target){break}}
+              if(!$target){throw 'The installed Windows browser did not reopen'}
+              $ws=[Net.WebSockets.ClientWebSocket]::new();$timeout=[Threading.CancellationTokenSource]::new(60000)
+              $ws.ConnectAsync([uri]$target.webSocketDebuggerUrl,$timeout.Token).GetAwaiter().GetResult()|Out-Null
+              Start-Sleep -Seconds 2
+              $restored=Send-CDP 1000 'Runtime.evaluate' @{expression='JSON.stringify({setting:getPref("windows-release-qa",""),bookmark:bookmarks.some(b=>b.url.includes("example.com")),onboardingVisible:!!document.getElementById("installed-setup"),onboarded:getPref("onboarded","")})';returnByValue=$true}
+              $report.restartState=$restored.result.value|ConvertFrom-Json
+              if($report.restartState.setting -ne 'saved' -or !$report.restartState.bookmark -or $report.restartState.onboardingVisible -or $report.restartState.onboarded -ne 'yes'){throw 'Windows settings/bookmarks/onboarding state did not survive restart'}
+              if($report.ai.status -eq 'passed'){
+               Send-CDP 1001 'Runtime.evaluate' @{expression='showAI();void 0'}|Out-Null
+               $saved=$null
+               for($i=0;$i -lt 30;$i++){Start-Sleep -Milliseconds 300;$r=Send-CDP (1010+$i) 'Runtime.evaluate' @{expression='(async()=>{const w=document.getElementById("conversations-view");if(!w)return null;try{return await w.executeJavaScript("JSON.stringify(JSON.parse(localStorage.getItem(\"poxey-ai-lab-history-v1\")||\"[]\").map(c=>({count:c.messages.length,last:c.messages.at(-1)?.content})))")}catch{return null}})()';returnByValue=$true;awaitPromise=$true};if($r.result.value){$saved=$r.result.value|ConvertFrom-Json;if(@($saved).Count){break}}}
+               if(!@($saved).Count){throw 'Saved Windows Conversations did not survive restart'}
+               $report.savedAIConversationsAfterRestart=@($saved).Count
+              }
+              $shot=Send-CDP 1100 'Page.captureScreenshot' @{format='png'}
+              [IO.File]::WriteAllBytes("$evidence\windows-after-restart.png",[Convert]::FromBase64String($shot.data))
               $report.passed=$true
             }finally{$ws.Dispose();$timeout.Dispose()}
           }catch{$report.failure=$_.Exception.Message;Write-Host "Startup verification failed: $($report.failure)"}
@@ -197,6 +262,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
   standard_user:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-11-arm
     timeout-minutes: 8
     steps:
@@ -206,9 +272,9 @@ jobs:
           $ErrorActionPreference='Stop'
           $dir=Join-Path $env:PUBLIC 'Poxey-Standard-QA'
           New-Item -ItemType Directory -Path $dir -Force|Out-Null
-          $url='https://poxeyx1-private-admin.6sk6r6gbpz.workers.dev/download/windows-26.2.2'
+          $url='https://poxeyx1-private-admin.6sk6r6gbpz.workers.dev/download/windows-26.2.3'
           Invoke-WebRequest $url -OutFile "$dir\PoxeySetup.exe" -TimeoutSec 90
-          if((Get-FileHash "$dir\PoxeySetup.exe" -Algorithm SHA256).Hash.ToLower() -ne 'e0f26524b47b470cf8ee6575aff18b2de922d6e00a5e7f13663593822dbade92'){throw 'Unexpected installer hash'}
+          if((Get-FileHash "$dir\PoxeySetup.exe" -Algorithm SHA256).Hash.ToLower() -ne '089df35092804ebcced7a595499bbfc5671fb765081adef29a239abfa908bb4d'){throw 'Unexpected installer hash'}
           $source=@'
           param([Parameter(Mandatory=$true)][string]$Installer,[Parameter(Mandatory=$true)][string]$OutputDirectory)
           $ErrorActionPreference='Stop'
@@ -252,7 +318,7 @@ jobs:
             if(!(Test-Path -LiteralPath $exe)){throw 'The standard-user installation was not created in its own profile'}
             $result.perUserInstall=$true
             Set-Stage 'current-user-registration'
-            $registration=@(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'|Where-Object {$_.DisplayName -like '*PoxeyX1*' -and $_.DisplayVersion -like '26.2.2*'})
+            $registration=@(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'|Where-Object {$_.DisplayName -like '*PoxeyX1*' -and $_.DisplayVersion -like '26.2.3*'})
             if($registration.Count -ne 1){throw 'Incorrect number of current-user uninstall entries'}
             # Electron Builder stores InstallLocation under Software\APP_GUID, rather
             # than duplicating it in the Apps & Features uninstall registration.
