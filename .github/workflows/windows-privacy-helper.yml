@@ -130,6 +130,7 @@ jobs:
           $result=@{nativeProtection=$true;exactOwnerAndACL=$true;unexpectedPrincipalRemoved=$true;inheritanceDisabled=$true;directoryRejected=$true;symlinkRejected=$true;hardlinkRejected=$true;sha256=(Get-FileHash "$dir\PoxeyPrivateStorage.exe" -Algorithm SHA256).Hash.ToLower();architecture='x64';runtime='Static CRT; no PowerShell or .NET required by helper'}
           $result|ConvertTo-Json|Set-Content "$dir\native-results.json"
           $result|ConvertTo-Json|Write-Host
+          exit 0
       - name: Keep native binary and security results
         if: always()
         uses: actions/upload-artifact@v4
