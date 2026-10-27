@@ -3,6 +3,11 @@ on:
   push:
     paths: ['.github/workflows/windows-startup.yml']
   workflow_dispatch:
+    inputs:
+      ai_only:
+        description: Run only the Windows 11 live AI acceptance job
+        type: boolean
+        default: true
 permissions:
   contents: read
 concurrency:
@@ -14,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-11-arm]
+        os: ${{ fromJSON(inputs.ai_only && '["windows-11-arm"]' || '["windows-2022","windows-11-arm"]') }}
     runs-on: ${{ matrix.os }}
     env:
       POXEY_TEST_RUNNER: ${{ matrix.os }}
@@ -194,6 +199,27 @@ jobs:
               if(Test-Path -LiteralPath $credentialFile){$report.ai.qaDeviceId=(Get-Content -LiteralPath $credentialFile -Raw|ConvertFrom-Json).device}
               Start-Sleep -Seconds 2
               Eval-Chat 141 '(async()=>{const c=await(await fetch("/api/config")).json();const r=await fetch("/api/screen/setup",{method:"POST",headers:{"Content-Type":"application/json","X-Lab-CSRF":c.csrf},body:JSON.stringify({enable:true,cloudConsent:true,app:"poxey-active-tab"})});return r.ok})()'|Out-Null
+              # Local negative checks use the actual Windows guest and no inference requests.
+              $report.ai.usageBefore=Eval-Chat 142 '(async()=>{const c=await(await fetch("/api/config")).json();return {modes:c.usage.modes,allowance:c.betaAllowance,resetsAt:c.usage.resetsAt}})()'
+              if($report.ai.usageBefore.modes.fast.limit -ne 30 -or $report.ai.usageBefore.modes.smart.limit -ne 10 -or $report.ai.usageBefore.modes.search.limit -ne 5){throw 'Configured daily ceilings changed'}
+              Eval-Host 143 'activeTab().webview.executeJavaScript("window.__qaPageReads=0;const original=document.createTreeWalker.bind(document);document.createTreeWalker=(...a)=>{window.__qaPageReads++;return original(...a)};void 0",true);void 0'|Out-Null
+              Start-Sleep -Milliseconds 300
+              $report.ai.privacyDisabled=Eval-Chat 144 '(async()=>{const c=await(await fetch("/api/config")).json(),h={"Content-Type":"application/json","X-Lab-CSRF":c.csrf};await fetch("/api/screen/setup",{method:"POST",headers:h,body:JSON.stringify({enable:false})});const r=await fetch("/api/chat",{method:"POST",headers:h,body:JSON.stringify({conversationId:"windows-privacy-qa",aiMode:"fast",messages:[{role:"user",content:"What is this page about?"}]})});return {status:r.status,body:await r.text()}})()'
+              $reads=Eval-Host 145 'activeTab().webview.executeJavaScript("window.__qaPageReads",true)'
+              if($report.ai.privacyDisabled.status -ne 403 -or $reads -ne 0){throw 'Disabled page sharing attempted to read or submit page evidence'}
+              $report.ai.privacyDisabled|Add-Member -NotePropertyName pageReads -NotePropertyValue $reads
+              Eval-Chat 146 '(async()=>{const c=await(await fetch("/api/config")).json();return(await fetch("/api/screen/setup",{method:"POST",headers:{"Content-Type":"application/json","X-Lab-CSRF":c.csrf},body:JSON.stringify({enable:true,cloudConsent:true,app:"poxey-active-tab"})})).ok})()'|Out-Null
+              # Deliberately stall only the disposable public page, not the browser UI.
+              # The existing 8-second transport deadline must stop honestly and recover.
+              Eval-Host 147 'activeTab().webview.executeJavaScript("const until=Date.now()+11000;while(Date.now()<until){};void 0",true);void 0'|Out-Null
+              Start-Sleep -Milliseconds 300
+              $report.ai.pageTimeout=Eval-Chat 148 '(async()=>{const c=await(await fetch("/api/config")).json(),at=performance.now();const r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json","X-Lab-CSRF":c.csrf},body:JSON.stringify({conversationId:"windows-timeout-qa",aiMode:"fast",messages:[{role:"user",content:"What is this page about?"}]})});return {status:r.status,body:await r.text(),ms:Math.round(performance.now()-at)}})()'
+              if($report.ai.pageTimeout.status -ne 422 -or $report.ai.pageTimeout.body -notmatch 'page reader timed out' -or $report.ai.pageTimeout.ms -gt 13000){throw 'Stalled page reader did not fail within its safe deadline'}
+              Start-Sleep -Seconds 4
+              $report.ai.browserResponsiveAfterTimeout=Eval-Host 149 'document.readyState==="complete"&&activeTab().webview.getURL().startsWith("https://example.com")'
+              if(!$report.ai.browserResponsiveAfterTimeout){throw 'Page timeout interrupted ordinary browsing'}
+              $report.ai.usageAfterLocalErrors=Eval-Chat 150 '(async()=>{const c=await(await fetch("/api/config")).json();return {modes:c.usage.modes,allowance:c.betaAllowance}})()'
+              if(($report.ai.usageBefore.modes|ConvertTo-Json -Depth 5 -Compress) -ne ($report.ai.usageAfterLocalErrors.modes|ConvertTo-Json -Depth 5 -Compress) -or $report.ai.usageBefore.allowance.dailyRemaining -ne $report.ai.usageAfterLocalErrors.allowance.dailyRemaining){throw 'Local privacy/timeout failures consumed personal AI allowance'}
               $cases=@(@{mode='fast';q='What is this page about? Explain in two simple sentences.';expect='domain|documentation';fresh=$true},@{mode='smart';q='Explain in two sentences why water boils at a lower temperature at high altitude.';expect='pressure';fresh=$true},@{mode='auto';q='Write a friendly one-sentence thank-you note to a teacher.';expect='thank';fresh=$true},@{mode='fast';q='Research the official Cloudflare Workers AI free daily neuron limit. Explain whether it is unlimited, citing the official source.';expect='10[, ]?000';fresh=$true},@{mode='auto';q='Does that mean unlimited AI? Explain simply.';expect='no|not|limit';fresh=$false})
               $seq=150
               foreach($case in $cases){Start-Sleep -Seconds 6;$seq++;$question=ConvertTo-Json -InputObject $case.q -Compress;$new=if($case.fresh){"document.getElementById('new').click();"}else{''};Eval-Chat $seq "$new document.querySelector('[data-mode=$($case.mode)]').click();document.getElementById('prompt').value=$question;document.getElementById('composer').requestSubmit();void 0"|Out-Null;$at=Get-Date;$reply=$null
@@ -207,6 +233,7 @@ jobs:
                if(($case.q -like 'Explain in two sentences*' -or $case.q -like 'Write a friendly*') -and ($reply.screenContext -or $reply.sources.Count)){throw 'Unrelated question accessed unnecessary page or research context'}
                if($case.q -like 'Research*' -and !(@($reply.sources|Where-Object {$_.url -like '*developers.cloudflare.com*'}).Count)){throw 'Research answer lacks the required official source'}
               }
+              $report.ai.usageAfterLive=Eval-Chat 890 '(async()=>{const c=await(await fetch("/api/config")).json();return {modes:c.usage.modes,allowance:c.betaAllowance,resetsAt:c.usage.resetsAt}})()'
               $report.ai.status='passed'
               $shot=Send-CDP 900 'Page.captureScreenshot' @{format='png'}
               [IO.File]::WriteAllBytes("$evidence\windows-conversations.png",[Convert]::FromBase64String($shot.data))
@@ -262,7 +289,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
   standard_user:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.ai_only
     runs-on: windows-11-arm
     timeout-minutes: 8
     steps:
