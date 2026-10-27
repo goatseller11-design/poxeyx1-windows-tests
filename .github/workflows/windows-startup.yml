@@ -8,6 +8,10 @@ on:
         description: Run only the Windows 11 live AI acceptance job
         type: boolean
         default: true
+      research_retest:
+        description: Run only the two research cases after the source-grounding repair
+        type: boolean
+        default: true
 permissions:
   contents: read
 concurrency:
@@ -24,6 +28,7 @@ jobs:
     env:
       POXEY_TEST_RUNNER: ${{ matrix.os }}
       POXEY_ACTIVITY_TEST: '1'
+      POXEY_RESEARCH_RETEST: ${{ inputs.research_retest && '1' || '0' }}
       POXEY_QA_INVITE: ${{ secrets.POXEY_QA_INVITE }}
     timeout-minutes: 10
     steps:
@@ -221,6 +226,7 @@ jobs:
               $report.ai.usageAfterLocalErrors=Eval-Chat 150 '(async()=>{const c=await(await fetch("/api/config")).json();return {modes:c.usage.modes,allowance:c.betaAllowance}})()'
               if(($report.ai.usageBefore.modes|ConvertTo-Json -Depth 5 -Compress) -ne ($report.ai.usageAfterLocalErrors.modes|ConvertTo-Json -Depth 5 -Compress) -or $report.ai.usageBefore.allowance.dailyRemaining -ne $report.ai.usageAfterLocalErrors.allowance.dailyRemaining){throw 'Local privacy/timeout failures consumed personal AI allowance'}
               $cases=@(@{mode='fast';q='What is this page about? Explain in two simple sentences.';expect='domain|documentation';fresh=$true},@{mode='smart';q='Explain in two sentences why water boils at a lower temperature at high altitude.';expect='pressure';fresh=$true},@{mode='auto';q='Write a friendly one-sentence thank-you note to a teacher.';expect='thank';fresh=$true},@{mode='fast';q='Research the official Cloudflare Workers AI free daily neuron limit. Explain whether it is unlimited, citing the official source.';expect='10[, ]?000';fresh=$true},@{mode='auto';q='Does that mean unlimited AI? Explain simply.';expect='no|not|limit';fresh=$false})
+              if($env:POXEY_RESEARCH_RETEST -eq '1'){$cases=@($cases|Select-Object -Last 2);$report.ai.coverage='Targeted research and follow-up retest; Fast/Smart/Auto/page checks remain recorded in run22'}
               $seq=150
               foreach($case in $cases){Start-Sleep -Seconds 6;$seq++;$question=ConvertTo-Json -InputObject $case.q -Compress;$new=if($case.fresh){"document.getElementById('new').click();"}else{''};Eval-Chat $seq "$new document.querySelector('[data-mode=$($case.mode)]').click();document.getElementById('prompt').value=$question;document.getElementById('composer').requestSubmit();void 0"|Out-Null;$at=Get-Date;$reply=$null
                for($i=0;$i -lt 80;$i++){Start-Sleep -Milliseconds 400;$seq++;$raw=Eval-Chat $seq 'JSON.stringify(JSON.parse(localStorage.getItem("poxey-ai-lab-history-v1")||"[]")[0]?.messages.at(-1)||{})';$candidate=$raw|ConvertFrom-Json;if($candidate.role -eq 'assistant' -and $candidate.status -ne 'pending'){$reply=$candidate;break}}
